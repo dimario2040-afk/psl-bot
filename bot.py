@@ -1,8 +1,9 @@
 """Looksmaxxing / PSL Telegram-бот.
 
-Стек: Aiogram 3.x + MediaPipe (локальная биометрия) + Gemini (VLM-мозги).
+Стек: Aiogram 3.x + MediaPipe (локальная биометрия) + VLM-мозги
+(Zhipu GLM по дефолту, любой OpenAI-совместимый endpoint через env).
 Работа: юзер шлёт фото -> MediaPipe считает fWHR/симметрию/tilt ->
-цифры + фото уходят в Gemini -> жёсткий структурированный разбор.
+цифры + фото уходят в нейронку -> жёсткий структурированный разбор.
 """
 import asyncio
 import io
@@ -12,7 +13,7 @@ import os
 import tempfile
 
 # Тяжёлая биометрия — ОПЦИОНАЛЬНА: на free-хостинге (Render, 512MB RAM)
-# mediapipe не влезет, и бот должен работать без него (только Gemini по фото).
+# mediapipe не влезет, и бот должен работать без него (только VLM по фото).
 try:
     import cv2
     import mediapipe as mp
@@ -31,8 +32,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+MODEL_API_KEY = os.getenv("MODEL_API_KEY", "")
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+MODEL_NAME = os.getenv("MODEL_NAME", "glm-4.6v-flash")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -258,51 +260,55 @@ lower third, bigonial width, zygos, anti-fraud (ракурс/свет), softmaxx
 Максимум конкретики по ЭТОМУ лицу.
 """
 
-# ---------------------------------------------------------------- gemini
-def analyze_with_gemini(photo_bytes: bytes, metrics_text: str) -> str:
-    """Отправляет фото + метрики в Gemini, возвращает разбор."""
-    from google import genai
-    from google.genai import types
+# ---------------------------------------------------------------- мозги (VLM)
+# Провайдер-агностик: любой OpenAI-совместимый endpoint с vision-моделью.
+# Дефолт — Zhipu (z.ai, регистрация по email, бесплатный glm-4.6v-flash).
+# Через env переключается на что угодно (Qwen, Gemini-OAI, OpenRouter…).
+def analyze_with_vlm(photo_bytes: bytes, metrics_text: str) -> str:
+    """Отправляет фото + метрики в VLM, возвращает разбор."""
+    import base64
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg"),
-            f"Биометрия лица (факты от MediaPipe): {metrics_text}\n\n"
-            "Разъеби по схеме из системного промпта. Жёстко, по делу.",
+    from openai import OpenAI
+
+    client = OpenAI(api_key=MODEL_API_KEY, base_url=MODEL_BASE_URL)
+    b64 = base64.b64encode(photo_bytes).decode("utf-8")
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": f"Биометрия лица (факты от MediaPipe): {metrics_text}\n\n"
+                        "Разъеби по схеме из системного промпта. Жёстко, по делу.",
+                    },
+                ],
+            },
         ],
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.9,
-            max_output_tokens=2048,
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
-                ),
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
-                ),
-            ],
-        ),
+        temperature=0.9,
+        max_tokens=2048,
     )
     try:
-        text = resp.text
-    except Exception:  # noqa: BLE001 — сработал safety filter, parts пустые
+        text = (resp.choices[0].message.content or "").strip()
+    except Exception:  # noqa: BLE001 — кривой/пустой ответ провайдера
         text = ""
-    if not text and getattr(resp, "candidates", None):
-        finish = resp.candidates[0].finish_reason
+    if not text:
+        finish = ""
+        try:
+            finish = resp.choices[0].finish_reason or ""
+        except Exception:  # noqa: BLE001, S110
+            pass
         text = (
-            f"⚠️ Gemini отфильтровала ответ (finish_reason={finish}). "
+            f"⚠️ Нейронка отфильтровала ответ (finish_reason={finish}). "
             "Попробуй другое фото: прямой ракурс, дневной свет, без очков."
         )
-    return text or "Gemini вернул пустой ответ. Попробуй другое фото."
+    return text
 
 # ---------------------------------------------------------------- бот
 dp = Dispatcher()
@@ -315,7 +321,7 @@ async def cmd_start(msg: Message) -> None:
         "Кидай своё фото (лицо крупно, без очков и фильтров) — "
         "прогоню через биометрию и выдам жёсткий разбор: "
         "PSL-рейтинг, кости, failo/halo и план softmaxxing.\n\n"
-        "Фото обрабатывается локально (MediaPipe) + Gemini. "
+        "Фото обрабатывается локально (MediaPipe) + нейронка. "
         "Ничего не храню — файл удаляется сразу после анализа.",
         parse_mode="HTML",
     )
@@ -334,12 +340,12 @@ async def cmd_help(msg: Message) -> None:
 
 @dp.message(F.photo)
 async def on_photo(msg: Message, bot: Bot) -> None:
-    if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-        await msg.answer("⚠️ Бот не настроен: нет TELEGRAM_TOKEN или GEMINI_API_KEY в .env")
+    if not TELEGRAM_TOKEN or not MODEL_API_KEY:
+        await msg.answer("⚠️ Бот не настроен: нет TELEGRAM_TOKEN или MODEL_API_KEY в .env")
         return
 
     status = await msg.answer(
-        "📐 Меряю череп…" if BIOMETRY_AVAILABLE else "🧠 Gemini думает…"
+        "📐 Меряю череп…" if BIOMETRY_AVAILABLE else "🧠 Нейронка думает…"
     )
     tmp_path = ""
     try:
@@ -349,7 +355,7 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         raw = photo_bytes.read()
 
         # 1. Локальная биометрия (в треде, чтобы не блочить loop).
-        # В лайт-режиме хостинга её нет — сразу идём к Gemini по фото.
+        # В лайт-режиме хостинга её нет — сразу идём к нейронке по фото.
         if BIOMETRY_AVAILABLE:
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 tmp.write(raw)
@@ -364,12 +370,12 @@ async def on_photo(msg: Message, bot: Bot) -> None:
                 return
             metrics_text = format_metrics(metrics)
             log.info("metrics: %s", metrics_text)
-            await status.edit_text(f"📐 Биометрия: {metrics_text}\n\n🧠 Gemini думает…")
+            await status.edit_text(f"📐 Биометрия: {metrics_text}\n\n🧠 Нейронка думает…")
         else:
             metrics_text = format_metrics({"face_found": False, "error": "biometry_unavailable"})
 
         # 2. VLM-разбор (тоже в треде — сетевые вызовы синхронные)
-        verdict = await asyncio.to_thread(analyze_with_gemini, raw, metrics_text)
+        verdict = await asyncio.to_thread(analyze_with_vlm, raw, metrics_text)
 
         header = f"📐 <b>Замеры:</b> {metrics_text}\n\n"
         # Режем длинные ответы под лимит TG (4096)
@@ -400,8 +406,8 @@ async def on_other(msg: Message) -> None:
 async def main() -> None:
     if not TELEGRAM_TOKEN:
         raise SystemExit("Нет TELEGRAM_TOKEN — создай .env по образцу .env.example")
-    if not GEMINI_API_KEY:
-        raise SystemExit("Нет GEMINI_API_KEY — возьми на https://aistudio.google.com/app/apikey")
+    if not MODEL_API_KEY:
+        raise SystemExit("Нет MODEL_API_KEY — возьми на https://z.ai (регистрация по email)")
     bot = Bot(token=TELEGRAM_TOKEN)
 
     # RENDER_EXTERNAL_URL задаёт сам Render; PUBLIC_URL — для любого другого
@@ -441,8 +447,9 @@ async def main() -> None:
         # 💻 Локальный режим: polling, полная биометрия если установлена.
         await bot.delete_webhook(drop_pending_updates=True)
         log.info(
-            "polling-режим, модель=%s, биометрия=%s",
-            GEMINI_MODEL,
+            "polling-режим, модель=%s @ %s, биометрия=%s",
+            MODEL_NAME,
+            MODEL_BASE_URL,
             "ON" if BIOMETRY_AVAILABLE else "OFF",
         )
         await dp.start_polling(bot)
