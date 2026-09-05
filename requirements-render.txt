@@ -1,0 +1,8 @@
+# Лёгкие зависимости для free-хостинга (Render, 512MB RAM).
+# MediaPipe + OpenCV сюда НЕ кладём — не влезут в память.
+# bot.py сам определяет их отсутствие и работает в лайт-режиме (только Gemini).
+aiogram>=3.13,<4
+aiohttp>=3.9
+openai>=1.0
+python-dotenv>=1.0
+numpy>=1.26
