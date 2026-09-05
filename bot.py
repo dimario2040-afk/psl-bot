@@ -26,7 +26,7 @@ except ImportError:
 import numpy as np
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -319,6 +319,64 @@ def analyze_with_vlm(photo_bytes: bytes, metrics_text: str) -> str:
         )
     return text
 
+
+# ---------------------------------------------------------------- простой слой
+SIMPLE_PROMPT = """Ты — свой чувак, который объясняет внешность ПРОСТЫМИ словами,
+как друг другу на кухне. Никаких терминов (PSL, fWHR, tilt, failo — запрещены),
+никаких цифр и замеров. Человек не обязан знать жаргон.
+
+Скажи по-человечески, с юмором, но по-доброму:
+1. Общее впечатление одной яркой фразой (вайб: строгий, мягкий, уставший,
+   дерзкий, добряк — что реально считывается).
+2. Что клёво — 1-2 штуки, обычными словами ("взгляд цепкий", "улыбка тащит").
+3. Что поправить — 1-2 штуки, мягко и с приколом ("поспать бы тебе", "борода просится").
+4. Итог — на кого похож вайбом (герой фильма, зверь, персонаж — играй ассоциациями).
+
+6-10 строк, русский язык. Жесть, цифры и диагнозы — НЕ твоя задача,
+их выдаст другой режим по кнопке. Если биометрия недоступна — смотри только фото.
+"""
+
+
+def analyze_simple(photo_bytes: bytes, metrics_text: str) -> str:
+    """Короткий разбор простыми словами (первый слой выдачи)."""
+    import base64
+
+    from openai import OpenAI
+
+    client = OpenAI(api_key=MODEL_API_KEY, base_url=MODEL_BASE_URL)
+    b64 = base64.b64encode(photo_bytes).decode("utf-8")
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": SIMPLE_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": f"Замеры для ориентира (не озвучивай цифры): {metrics_text}\n\n"
+                        "Опиши человека простыми словами по схеме из системного промпта.",
+                    },
+                ],
+            },
+        ],
+        temperature=0.9,
+        max_tokens=800,
+    )
+    try:
+        text = (resp.choices[0].message.content or "").strip()
+    except Exception:  # noqa: BLE001
+        text = ""
+    return text or "Не разглядел, кинь фото почётче 👇"
+
+
+# Контекст для кнопки "подробный разбор": user_id -> (photo_bytes, metrics_text).
+_pending_full: dict[int, tuple[bytes, str]] = {}
+
 # ---------------------------------------------------------------- бот
 dp = Dispatcher()
 
@@ -328,8 +386,9 @@ async def cmd_start(msg: Message) -> None:
     await msg.answer(
         "💀 <b>PSL-бот на связи.</b>\n\n"
         "Кидай своё фото (лицо крупно, без очков и фильтров) — "
-        "прогоню через биометрию и выдам жёсткий разбор: "
-        "PSL-рейтинг, кости, failo/halo и план softmaxxing.\n\n"
+        "сначала скажу по-человечески, без занудства. "
+        "А если хочешь жести — жми кнопку «🔪 Жёсткий разбор»: "
+        "там PSL-рейтинг, кости, failo/halo и план прокачки.\n\n"
         "Фото обрабатывается локально (MediaPipe) + нейронка. "
         "Ничего не храню — файл удаляется сразу после анализа.",
         parse_mode="HTML",
@@ -383,18 +442,19 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         else:
             metrics_text = format_metrics({"face_found": False, "error": "biometry_unavailable"})
 
-        # 2. VLM-разбор (тоже в треде — сетевые вызовы синхронные)
-        verdict = await asyncio.to_thread(analyze_with_vlm, raw, metrics_text)
+        # 2. Первый слой: разбор простыми словами (тоже в треде)
+        simple = await asyncio.to_thread(analyze_simple, raw, metrics_text)
 
-        header = f"📐 Замеры: {metrics_text}\n\n"
-        # Режем длинные ответы под лимит TG (4096)
-        chunk_size = 4000 - len(header)
-        first = True
-        for i in range(0, len(verdict), chunk_size):
-            chunk = verdict[i : i + chunk_size]
-            await msg.answer((header if first else "") + chunk)
-            first = False
+        # Запоминаем контекст для кнопки "подробный разбор"
+        _pending_full[msg.from_user.id] = (raw, metrics_text)
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔪 Жёсткий разбор", callback_data="full_roast")]
+            ]
+        )
         await status.delete()
+        await msg.answer(simple, reply_markup=kb)
     except Exception as exc:  # noqa: BLE001 — юзер должен видеть ошибку текстом
         log.exception("photo handling failed")
         await msg.answer(f"💥 Упал с ошибкой: {exc}\nПопробуй другое фото.")
@@ -410,6 +470,38 @@ async def on_photo(msg: Message, bot: Bot) -> None:
 @dp.message()
 async def on_other(msg: Message) -> None:
     await msg.answer("Мне нужно именно <b>фото</b>, не текст. Кидай ебало 👇", parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "full_roast")
+async def on_full_roast(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка 'Жёсткий разбор': полный PSL-разбор по сохранённому фото."""
+    data = _pending_full.get(cb.from_user.id)
+    if not data:
+        await cb.answer("Фото устарело — кинь заново 👇", show_alert=True)
+        return
+    await cb.answer("Готовлю жесть…")
+    raw, metrics_text = data
+    status = await cb.message.answer("🧠 Нейронка думает…")
+    try:
+        # Полный разбор (в треде — сетевой вызов синхронный)
+        verdict = await asyncio.to_thread(analyze_with_vlm, raw, metrics_text)
+
+        header = f"📐 Замеры: {metrics_text}\n\n"
+        # Режем длинные ответы под лимит TG (4096)
+        chunk_size = 4000 - len(header)
+        first = True
+        for i in range(0, len(verdict), chunk_size):
+            chunk = verdict[i : i + chunk_size]
+            await cb.message.answer((header if first else "") + chunk)
+            first = False
+        await status.delete()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("full roast failed")
+        await cb.message.answer(f"💥 Упал с ошибкой: {exc}\nПопробуй ещё раз кнопкой.")
+        try:
+            await status.delete()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
 
 async def main() -> None:
