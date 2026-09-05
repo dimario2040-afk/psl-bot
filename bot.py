@@ -261,26 +261,36 @@ lower third, bigonial width, zygos, anti-fraud (ракурс/свет), softmaxx
 # ---------------------------------------------------------------- gemini
 def analyze_with_gemini(photo_bytes: bytes, metrics_text: str) -> str:
     """Отправляет фото + метрики в Gemini, возвращает разбор."""
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=SYSTEM_PROMPT,
-        safety_settings={
-            "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-        },
-        generation_config={"temperature": 0.9, "max_output_tokens": 2048},
-    )
-    resp = model.generate_content(
-        [
-            {"mime_type": "image/jpeg", "data": photo_bytes},
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg"),
             f"Биометрия лица (факты от MediaPipe): {metrics_text}\n\n"
             "Разъеби по схеме из системного промпта. Жёстко, по делу.",
-        ]
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.9,
+            max_output_tokens=2048,
+            safety_settings=[
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
+                ),
+            ],
+        ),
     )
     try:
         text = resp.text
