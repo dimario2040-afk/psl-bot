@@ -1,0 +1,7 @@
+aiogram>=3.13,<4
+mediapipe>=0.10.14
+# headless: нам не нужен imshow, а в slim-Docker нет libGL для обычного cv2
+opencv-python-headless>=4.9
+numpy>=1.26
+google-generativeai>=0.8
+python-dotenv>=1.0
