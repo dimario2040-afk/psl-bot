@@ -166,11 +166,15 @@ def analyze_face(image_path: str) -> dict:
         lower_third = _dist(P("upper_lip"), P("chin"))
         out["lower_third_ratio"] = round(lower_third / bizygo, 3) if bizygo > 0 else None
 
-        # --- canthal tilt: угол линии глаз (град). + = hunter, - = prey
+        # --- canthal tilt: угол линии глаз (град). + = hunter, - = prey.
+        # Нормализация к (-90, 90]: у правого глаза outer левее inner (dx<0)
+        # и сырой atan2 даёт ~178° вместо правильных ~-2° (та же прямая).
         def eye_tilt(inner: np.ndarray, outer: np.ndarray) -> float:
             dx = outer[0] - inner[0]
             dy = inner[1] - outer[1]  # y растёт вниз -> инверсия
-            return round(math.degrees(math.atan2(dy, dx)), 2)
+            deg = math.degrees(math.atan2(dy, dx))
+            deg = ((deg + 90) % 180) - 90
+            return round(deg, 2)
 
         tilt_r = eye_tilt(P("eye_r_inner"), P("eye_r_outer"))
         tilt_l = eye_tilt(P("eye_l_inner"), P("eye_l_outer"))
@@ -211,7 +215,7 @@ def format_metrics(m: dict) -> str:
     if m.get("jaw_to_zygo") is not None:
         lines.append(f"jaw/zygo={m['jaw_to_zygo']} (цель ~0.9+)")
     if m.get("mouth_to_zygo") is not None:
-        lines.append(f"mouth/zygo={m['mouth_to_zygo']} (цель ~0.5+)")
+        lines.append(f"mouth/zygo={m['mouth_to_zygo']} (идеал ~0.4+)")
     if m.get("lower_third_ratio") is not None:
         lines.append(f"lower-third={m['lower_third_ratio']}")
     if m.get("canthal_tilt_avg") is not None:
@@ -245,6 +249,9 @@ lower third, bigonial width, zygos, anti-fraud (ракурс/свет), softmaxx
 челюсть, шея, стрижка, ракурс.
 Если вместо замеров сказано, что биометрия недоступна (лайт-режим хостинга) —
 оценивай пропорции ВИЗУАЛЬНО по фото, так же жёстко и по тем же пунктам.
+
+Тир определяй СТРОГО по числу, без натяжек: ниже 2.5 = sub-5/LTN,
+2.5-3.2 = MTN, 3.3-3.9 = HTN, 4.0+ = Chad. Число 2.2 — это LTN, а не MTN.
 
 Формат ответа (строго, на русском):
 1. 💀 ВЕРДИКТ: PSL X.X — тир (sub-5/LTN/MTN/HTN/Chadlite/Chad) + одна жёсткая фраза.
@@ -292,7 +299,9 @@ def analyze_with_vlm(photo_bytes: bytes, metrics_text: str) -> str:
             },
         ],
         temperature=0.9,
-        max_tokens=2048,
+        # 4096: reasoning-модели (GLM-4.6v) тратят токены на размышления,
+        # при 2048 ответ обрывался на полуслове (finish_reason=length).
+        max_tokens=4096,
     )
     try:
         text = (resp.choices[0].message.content or "").strip()
@@ -377,7 +386,7 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         # 2. VLM-разбор (тоже в треде — сетевые вызовы синхронные)
         verdict = await asyncio.to_thread(analyze_with_vlm, raw, metrics_text)
 
-        header = f"📐 <b>Замеры:</b> {metrics_text}\n\n"
+        header = f"📐 Замеры: {metrics_text}\n\n"
         # Режем длинные ответы под лимит TG (4096)
         chunk_size = 4000 - len(header)
         first = True
