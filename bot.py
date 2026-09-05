@@ -305,16 +305,14 @@ def analyze_with_vlm(photo_bytes: bytes, metrics_text: str) -> str:
         # при 2048 ответ обрывался на полуслове (finish_reason=length).
         max_tokens=4096,
     )
+    finish = ""
     try:
         text = (resp.choices[0].message.content or "").strip()
+        finish = resp.choices[0].finish_reason or ""
     except Exception:  # noqa: BLE001 — кривой/пустой ответ провайдера
         text = ""
+    log.info("full: finish=%s chars=%d", finish, len(text))
     if not text:
-        finish = ""
-        try:
-            finish = resp.choices[0].finish_reason or ""
-        except Exception:  # noqa: BLE001, S110
-            pass
         text = (
             f"⚠️ Нейронка отфильтровала ответ (finish_reason={finish}). "
             "Попробуй другое фото: прямой ракурс, дневной свет, без очков."
@@ -376,13 +374,17 @@ def analyze_simple(photo_bytes: bytes, metrics_text: str) -> str:
             },
         ],
         temperature=0.9,
-        max_tokens=800,
+        # 2048: reasoning съедает бюджет, при 800 контент приходил пустым.
+        max_tokens=2048,
     )
+    finish = ""
     try:
         text = (resp.choices[0].message.content or "").strip()
+        finish = resp.choices[0].finish_reason or ""
     except Exception:  # noqa: BLE001
         text = ""
-    return text or "Не разглядел, кинь фото почётче 👇"
+    log.info("simple: finish=%s chars=%d", finish, len(text))
+    return text
 
 
 # Контекст для кнопки "подробный разбор": user_id -> (photo_bytes, metrics_text).
@@ -465,11 +467,19 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             ]
         )
         await status.delete()
-        # Футер-вирус: подталкиваем переслать другу (ретеншн).
-        await msg.answer(
-            simple + "\n\n😏 Перешли другу — пусть тоже узнает правду",
-            reply_markup=kb,
-        )
+        if simple:
+            # Футер-вирус: подталкиваем переслать другу (ретеншн).
+            await msg.answer(
+                simple + "\n\n😏 Перешли другу — пусть тоже узнает правду",
+                reply_markup=kb,
+            )
+        else:
+            # Простой слой не выдал текст — кнопка жести всё равно живая
+            # (у полного разбора лимит больше, может прорваться).
+            await msg.answer(
+                "Не разглядел по-простому — жми, разъебу по-полной 👇",
+                reply_markup=kb,
+            )
     except Exception as exc:  # noqa: BLE001 — юзер должен видеть ошибку текстом
         log.exception("photo handling failed")
         await msg.answer(f"💥 Упал с ошибкой: {exc}\nПопробуй другое фото.")
