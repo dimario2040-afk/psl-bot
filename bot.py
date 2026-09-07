@@ -345,6 +345,10 @@ SIMPLE_PROMPT = """Ты — друг-карикатурист: описывае�
 профессию, точный возраст. Не знаешь — шути, а не выдумывай.
 Жесть, цифры и диагнозы — НЕ твоя задача, их выдаст другой режим по кнопке.
 Если биометрия недоступна — смотри только фото.
+
+В САМОМ КОНЦЕ ответа добавь отдельной строкой технические оценки для диаграммы
+(это не часть текста, её вырежет код): SCORES: брутальность=X, няшность=X,
+харизма=X, ухоженность=X, дерзость=X, загадочность=X — каждая 0-10, честно по фото.
 """
 
 SIMPLE_PROMPT_SOFT = """Ты — автор добрых дружеских шаржей для развлекательного теста.
@@ -352,6 +356,8 @@ SIMPLE_PROMPT_SOFT = """Ты — автор добрых дружеских ша
 комплименты с юмором, яркие сравнения с героями фильмов и животными.
 Простыми словами, без терминов и цифр. Два абзаца, русский язык.
 Описывай только то, что видно на фото, ничего не выдумывай.
+В САМОМ КОНЦЕ добавь строкой: SCORES: брутальность=X, няшность=X, харизма=X,
+ухоженность=X, дерзость=X, загадочность=X (каждая 0-10, честно по фото).
 """
 
 
@@ -424,6 +430,86 @@ def analyze_simple(photo_bytes: bytes, metrics_text: str) -> str:
 # Контекст для кнопки "подробный разбор": user_id -> (photo_bytes, metrics_text).
 _pending_full: dict[int, tuple[bytes, str]] = {}
 
+# Оси диаграммы статов (ключи — lowercase для парсинга SCORES-строки).
+STAT_LABELS = ["Брутальность", "Няшность", "Харизма", "Ухоженность", "Дерзость", "Загадочность"]
+
+
+def parse_scores(text: str) -> tuple[str, dict[str, float]]:
+    """Вырезает SCORES-строку из ответа, возвращает (чистый текст, оценки)."""
+    import re
+
+    scores: dict[str, float] = {}
+    m = re.search(r"SCORES:\s*(.+)", text)
+    if m:
+        for part in m.group(1).split(","):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                try:
+                    scores[k.strip().lower()] = max(0.0, min(10.0, float(v.strip())))
+                except ValueError:
+                    pass
+        text = (text[: m.start()] + text[m.end() :]).strip()
+    return text, scores
+
+
+def _label_font(size: int):
+    """Шрифт с кириллицей: DejaVu на Linux, Arial на Windows, иначе дефолт."""
+    import os
+
+    from PIL import ImageFont
+
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+    ):
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:  # noqa: BLE001
+                pass
+    return ImageFont.load_default()
+
+
+def draw_radar(scores: dict[str, float]) -> bytes:
+    """Радар-диаграмма статов 800x800 PNG (тёмная тема, неон)."""
+    import io
+    import math
+
+    from PIL import Image, ImageDraw
+
+    W = H = 800
+    cx = cy = 400
+    R = 290
+    vals = [scores.get(k.lower(), 5.0) for k in STAT_LABELS]
+
+    def pt(i: int, r: float) -> tuple[float, float]:
+        a = -math.pi / 2 + i * 2 * math.pi / len(STAT_LABELS)
+        return (cx + r * math.cos(a), cy + r * math.sin(a))
+
+    base = Image.new("RGB", (W, H), (16, 16, 22))
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(ov)
+    for ring in (R, R * 0.66, R * 0.33):
+        d.line([pt(i, ring) for i in range(6)] + [pt(0, ring)], fill=(80, 80, 110), width=2)
+    for i in range(6):
+        d.line([pt(i, 0), pt(i, R)], fill=(55, 55, 75), width=1)
+    poly = [pt(i, R * v / 10) for i, v in enumerate(vals)]
+    d.polygon(poly, fill=(255, 80, 120, 110), outline=(255, 80, 120))
+    for x, y in poly:
+        d.ellipse([x - 6, y - 6, x + 6, y + 6], fill=(255, 80, 120))
+    img = Image.alpha_composite(base.convert("RGBA"), ov).convert("RGB")
+    d2 = ImageDraw.Draw(img)
+    font = _label_font(30)
+    num_font = _label_font(26)
+    for i in range(6):
+        x, y = pt(i, R + 44)
+        d2.text((x, y), STAT_LABELS[i], fill=(230, 230, 240), font=font, anchor="mm")
+        xv, yv = pt(i, R * vals[i] / 10)
+        d2.text((xv, yv - 16), str(int(round(vals[i]))), fill=(255, 200, 210), font=num_font, anchor="mm")
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
 # ---------------------------------------------------------------- бот
 dp = Dispatcher()
 
@@ -435,7 +521,8 @@ async def cmd_start(msg: Message) -> None:
         "Кидай своё фото (лицо крупно, без очков и фильтров) — "
         "сначала скажу по-человечески, без занудства. "
         "А если хочешь жести — жми кнопку «📊 Подробный разбор»: "
-        "там PSL-рейтинг, кости, failo/halo и план прокачки.\n\n"
+        "там PSL-рейтинг, кости, failo/halo и план прокачки.\n"
+        "В ответ получишь вердикт, твоё фото и диаграмму статов.\n\n"
         "Фото обрабатывается локально (MediaPipe) + нейронка. "
         "Ничего не храню — файл удаляется сразу после анализа.",
         parse_mode="HTML",
@@ -495,25 +582,41 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         # Запоминаем контекст для кнопки "подробный разбор"
         _pending_full[msg.from_user.id] = (raw, metrics_text)
 
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")]
-            ]
-        )
+        import urllib.parse
+
+        from aiogram.types import BufferedInputFile
+
         await status.delete()
         if simple:
+            clean, scores = parse_scores(simple)
             # Футер-вирус: подталкиваем переслать другу (ретеншн).
-            await msg.answer(
-                simple + "\n\n😏 Перешли другу — пусть тоже узнает правду",
-                reply_markup=kb,
-            )
+            await msg.answer(clean + "\n\n😏 Перешли другу — пусть тоже узнает правду")
         else:
-            # Простой слой не выдал текст — кнопка жести всё равно живая
-            # (у полного разбора лимит больше, может прорваться).
-            await msg.answer(
-                "Не разглядел по-простому — жми, разъебу по-полной 👇",
-                reply_markup=kb,
-            )
+            clean, scores = "", {}
+            await msg.answer("Не разглядел по-простому — но статы и жесть ниже 👇")
+
+        # 3. Оригинальное фото обратно
+        await msg.answer_photo(BufferedInputFile(raw, filename="you.jpg"))
+
+        # 4. Диаграмма статов + кнопки (жесть по требованию + расшарилка)
+        diagram = await asyncio.to_thread(draw_radar, scores)
+        share_url = (
+            "https://t.me/share/url?url="
+            + urllib.parse.quote("https://t.me/lookernice_bot", safe="")
+            + "&text="
+            + urllib.parse.quote("Глянь какой у меня вердикт 😏", safe="")
+        )
+        kb2 = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
+                [InlineKeyboardButton(text="📤 Кинуть другу", url=share_url)],
+            ]
+        )
+        await msg.answer_photo(
+            BufferedInputFile(diagram, filename="stats.png"),
+            caption="📊 Твои статы",
+            reply_markup=kb2,
+        )
     except Exception as exc:  # noqa: BLE001 — юзер должен видеть ошибку текстом
         log.exception("photo handling failed")
         await msg.answer(f"💥 Упал с ошибкой: {exc}\nПопробуй другое фото.")
