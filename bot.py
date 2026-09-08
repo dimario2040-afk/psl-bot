@@ -452,22 +452,124 @@ def parse_scores(text: str) -> tuple[str, dict[str, float]]:
     return text, scores
 
 
-def _label_font(size: int):
+def _label_font(size: int, bold: bool = True):
     """Шрифт с кириллицей: DejaVu на Linux, Arial на Windows, иначе дефолт."""
     import os
 
     from PIL import ImageFont
 
-    for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
-    ):
+    cands = (
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        )
+        if bold
+        else (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        )
+    )
+    wins = (
+        (r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\arial.ttf")
+        if bold
+        else (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\arialbd.ttf")
+    )
+    for path in cands + wins:
         if os.path.exists(path):
             try:
                 return ImageFont.truetype(path, size)
             except Exception:  # noqa: BLE001
                 pass
     return ImageFont.load_default()
+
+
+def _wrap(draw, text: str, font, max_w: int) -> list[str]:
+    """Перенос текста по словам под ширину в пикселях."""
+    lines: list[str] = []
+    for para in text.split("\n"):
+        words, cur = para.split(), ""
+        for w in words:
+            probe = (cur + " " + w).strip()
+            if draw.textlength(probe, font=font) <= max_w or not cur:
+                cur = probe
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        lines.append("")  # отбивка абзаца
+    return lines
+
+
+def build_card(photo_bytes: bytes, verdict: str, scores: dict[str, float]) -> bytes:
+    """Одна итоговая карточка: фото + панель статов + текст вердикта."""
+    import io
+
+    from PIL import Image, ImageDraw, ImageOps
+
+    W = 1280
+    M = 44
+    BG = (16, 16, 22)
+    NEON = (255, 80, 120)
+    DIM = (110, 110, 135)
+    TXT = (232, 232, 240)
+
+    photo = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+    photo = ImageOps.fit(photo, (560, 560), Image.LANCZOS)
+
+    vals = [scores.get(k.lower(), 5.0) for k in STAT_LABELS]
+
+    # --- верх: фото слева, статы справа
+    top_h = 560
+    # --- текст вердикта
+    font_txt = _label_font(31, bold=False)
+    meas = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    text_lines = _wrap(meas, verdict, font_txt, W - 2 * M)[:26]  # кап на всякий
+    text_h = len(text_lines) * 44
+    # --- шапка и подвал
+    H = 110 + top_h + 40 + text_h + 30 + 80
+
+    card = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(card)
+    font_big = _label_font(44)
+    font_mid = _label_font(30)
+    font_small = _label_font(26, bold=False)
+
+    d.text((M, 30), "LOOKERNICE", fill=TXT, font=font_big)
+    d.text((M, 78), "разбор по фото", fill=DIM, font=font_small)
+    d.text((W - M, 40), "@lookernice_bot", fill=DIM, font=font_small, anchor="ra")
+
+    card.paste(photo, (M, 110))
+    # рамка фото
+    d.rectangle([M, 110, M + 560, 110 + top_h], outline=(45, 45, 60), width=2)
+
+    # панель статов
+    px = M + 560 + 44
+    pw = W - px - M
+    d.text((px, 110), "СТАТЫ", fill=DIM, font=font_mid)
+    y = 160
+    for i, label in enumerate(STAT_LABELS):
+        v = vals[i]
+        d.text((px, y), label, fill=TXT, font=font_mid)
+        d.text((px + pw, y), f"{v:.0f}", fill=NEON, font=font_mid, anchor="ra")
+        y += 40
+        d.rounded_rectangle([px, y, px + pw, y + 16], radius=8, fill=(45, 45, 60))
+        if v > 0.3:
+            d.rounded_rectangle([px, y, px + int(pw * v / 10), y + 16], radius=8, fill=NEON)
+        y += 34
+
+    # текст вердикта
+    ty = 110 + top_h + 40
+    for line in text_lines:
+        if line:
+            d.text((M, ty), line, fill=TXT, font=font_txt)
+        ty += 44
+
+    d.text((M, H - 56), "t.me/lookernice_bot — кинь своё фото и получи такую же", fill=DIM, font=font_small)
+
+    buf = io.BytesIO()
+    card.save(buf, "PNG")
+    return buf.getvalue()
 
 
 def draw_radar(scores: dict[str, float]) -> bytes:
@@ -595,11 +697,8 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             clean, scores = "", {}
             await msg.answer("Не разглядел по-простому — но статы и жесть ниже 👇")
 
-        # 3. Оригинальное фото обратно
-        await msg.answer_photo(BufferedInputFile(raw, filename="you.jpg"))
-
-        # 4. Диаграмма статов + кнопки (жесть по требованию + расшарилка)
-        diagram = await asyncio.to_thread(draw_radar, scores)
+        # 3. Одна итоговая карточка: фото + статы + вердикт + кнопки
+        card = await asyncio.to_thread(build_card, raw, clean, scores)
         share_url = (
             "https://t.me/share/url?url="
             + urllib.parse.quote("https://t.me/lookernice_bot", safe="")
@@ -613,8 +712,8 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             ]
         )
         await msg.answer_photo(
-            BufferedInputFile(diagram, filename="stats.png"),
-            caption="📊 Твои статы",
+            BufferedInputFile(card, filename="card.png"),
+            caption="Забирай 😏 Перешли другу — пусть тоже узнает правду",
             reply_markup=kb2,
         )
     except Exception as exc:  # noqa: BLE001 — юзер должен видеть ошибку текстом
