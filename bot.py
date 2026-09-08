@@ -26,7 +26,13 @@ except ImportError:
 import numpy as np
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQuery,
+    Message,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -339,6 +345,9 @@ SIMPLE_PROMPT = """Ты — друг-карикатурист: описывае�
 Абзацы про РАЗНОЕ, дубли запрещены: первый — общее впечатление и вайб героя;
 второй — конкретные детали внешности (взгляд, улыбка, стиль, одежда), ни одна
 мысль, шутка или деталь из первого не повторяется во втором.
+Стиль — взрослая сатира, остроумно и хлёстко. Запрещены детские сюсюканья,
+уменьшительно-ласкательные ("глазоньки", "носик") и кривляния — так пишет
+дешёвая нейронка, а ты пишешь как взрослый.
 Пример стиля: "уверенность волка, взгляд — как у совы после ночной смены,
 а улыбка такая, будто он только что вспомнил твой позор со школы".
 
@@ -363,7 +372,7 @@ SIMPLE_PROMPT_SOFT = """Ты — автор добрых дружеских ша
 """
 
 
-def _simple_call(system_prompt: str, photo_b64: str, metrics_text: str):
+def _simple_call(system_prompt: str, photo_b64: str, metrics_text: str, temperature: float = 0.8):
     """Один вызов simple-слоя. Может кинуть исключение (в т.ч. 1301 фильтр)."""
     from openai import OpenAI
 
@@ -387,7 +396,8 @@ def _simple_call(system_prompt: str, photo_b64: str, metrics_text: str):
                 ],
             },
         ],
-        temperature=0.9,
+        # 0.8: спокойнее и взрослее, чем 0.9 (меньше детских кривляний).
+        temperature=temperature,
         # 4096: reasoning прожорлив, при меньших лимитах ответ обрывался
         # на полуслове (и SCORES-строка в конце терялась).
         max_tokens=4096,
@@ -432,6 +442,8 @@ def analyze_simple(photo_bytes: bytes, metrics_text: str) -> str:
 
 # Контекст для кнопки "подробный разбор": user_id -> (photo_bytes, metrics_text).
 _pending_full: dict[int, tuple[bytes, str]] = {}
+# file_id последней карточки юзера — для инлайн-шаринга другу.
+_card_file: dict[int, str] = {}
 
 # Оси диаграммы статов (ключи — lowercase для парсинга SCORES-строки).
 STAT_LABELS = ["Брутальность", "Няшность", "Харизма", "Ухоженность", "Дерзость", "Загадочность"]
@@ -687,38 +699,42 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         # Запоминаем контекст для кнопки "подробный разбор"
         _pending_full[msg.from_user.id] = (raw, metrics_text)
 
-        import urllib.parse
-
         from aiogram.types import BufferedInputFile
 
         await status.delete()
         if simple:
             clean, scores = parse_scores(simple)
-            # Футер-вирус: подталкиваем переслать другу (ретеншн).
-            await msg.answer(clean + "\n\n😏 Перешли другу — пусть тоже узнает правду")
+            caption = "Забирай 😏 Перешли другу — пусть тоже узнает правду"
         else:
             clean, scores = "", {}
-            await msg.answer("Не разглядел по-простому — но статы и жесть ниже 👇")
+            caption = "Не разглядел по-простому — статы ниже, жесть по кнопке 👇"
 
-        # 3. Одна итоговая карточка: фото + статы + вердикт + кнопки
+        # 3. Одна итоговая карточка: фото + статы + вердикт + кнопки.
+        # Текст отдельным постом НЕ шлём — всё уже внутри картинки.
         card = await asyncio.to_thread(build_card, raw, clean, scores)
-        share_url = (
-            "https://t.me/share/url?url="
-            + urllib.parse.quote("https://t.me/lookernice_bot", safe="")
-            + "&text="
-            + urllib.parse.quote("Глянь какой у меня вердикт 😏", safe="")
-        )
         kb2 = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
-                [InlineKeyboardButton(text="📤 Кинуть другу", url=share_url)],
+                [
+                    InlineKeyboardButton(
+                        text="📊 Подробный разбор",
+                        callback_data=f"full_roast:{msg.from_user.id}",
+                    )
+                ],
+                # Инлайн-шаринг: карточка целиком улетает другу от имени бота.
+                # Требует включённого inline-режима у BotFather (/setinline).
+                [InlineKeyboardButton(text="📤 Кинуть другу", switch_inline_query="")],
             ]
         )
-        await msg.answer_photo(
+        sent = await msg.answer_photo(
             BufferedInputFile(card, filename="card.png"),
-            caption="Забирай 😏 Перешли другу — пусть тоже узнает правду",
+            caption=caption,
             reply_markup=kb2,
         )
+        # file_id карточки — для отправки её же через инлайн другим людям.
+        try:
+            _card_file[msg.from_user.id] = sent.photo[-1].file_id
+        except Exception:  # noqa: BLE001, S110
+            pass
     except Exception as exc:  # noqa: BLE001 — юзер должен видеть ошибку текстом
         log.exception("photo handling failed")
         await msg.answer(f"💥 Упал с ошибкой: {exc}\nПопробуй другое фото.")
@@ -736,10 +752,68 @@ async def on_other(msg: Message) -> None:
     await msg.answer("Мне нужно именно <b>фото</b>, не текст. Кидай ебало 👇", parse_mode="HTML")
 
 
-@dp.callback_query(F.data == "full_roast")
+@dp.inline_query()
+async def on_inline(inline: InlineQuery) -> None:
+    """Инлайн-шаринг: отдать карточку юзера в выбранный им чат целиком."""
+    from aiogram.types import (
+        InlineQueryResultArticle,
+        InlineQueryResultCachedPhoto,
+        InputTextMessageContent,
+    )
+
+    fid = _card_file.get(inline.from_user.id)
+    if not fid:
+        await inline.answer(
+            [
+                InlineQueryResultArticle(
+                    id="none",
+                    title="Сначала получи вердикт",
+                    description="Напиши боту в личку и кинь своё фото",
+                    input_message_content=InputTextMessageContent(
+                        message_text="Получи свой разбор внешности: https://t.me/lookernice_bot"
+                    ),
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="🤖 К боту", url="https://t.me/lookernice_bot")]
+                        ]
+                    ),
+                )
+            ],
+            cache_time=5,
+        )
+        return
+    owner = inline.from_user.id
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Подробный разбор", callback_data=f"full_roast:{owner}")],
+            [InlineKeyboardButton(text="🤖 Проверь себя", url="https://t.me/lookernice_bot")],
+        ]
+    )
+    await inline.answer(
+        [
+            InlineQueryResultCachedPhoto(
+                id=f"card{owner}",
+                photo_file_id=fid,
+                title="Мой вердикт",
+                description="Отправить карточку в этот чат",
+                caption="Забирай 😏 Проверь себя: https://t.me/lookernice_bot",
+                reply_markup=kb,
+            )
+        ],
+        cache_time=5,
+    )
+
+
+@dp.callback_query(F.data.startswith("full_roast"))
 async def on_full_roast(cb: CallbackQuery, bot: Bot) -> None:
-    """Кнопка 'Жёсткий разбор': полный PSL-разбор по сохранённому фото."""
-    data = _pending_full.get(cb.from_user.id)
+    """Кнопка 'Подробный разбор': полный PSL-разбор по сохранённому фото.
+
+    callback_data вида full_roast:<owner_id> — чтобы кнопка работала и на
+    пересланных/инлайн-карточках у друзей (разбор того фото, что на карточке).
+    """
+    parts = cb.data.split(":")
+    owner = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else cb.from_user.id
+    data = _pending_full.get(owner)
     if not data:
         await cb.answer("Фото устарело — кинь заново 👇", show_alert=True)
         return
